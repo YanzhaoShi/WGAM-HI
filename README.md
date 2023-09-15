@@ -5,11 +5,14 @@ Official code for "Weakly Guided Attention Model with Hierarchical Interaction f
 In this paper, we propose a novel Weakly Guided Attention Model with Hierarchical Interaction, named WGAM-HI, to improve Brain CT report generation.
 
 ## Environment
-python=3.6.9
+<pre>
+  <code>
+    python=3.6.9
+    pytorch=1.10.0
+    torchvision=0.11.1
+  </code>
+</pre>
 
-pytorch=1.10.0
-
-torchvision=0.11.1
 
 ## Training and Testing
 The source code for training is tools/train.py. To run this code, please use the following command:
