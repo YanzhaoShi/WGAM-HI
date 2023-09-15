@@ -11,6 +11,21 @@ pytorch=1.10.0
 
 torchvision=0.11.1
 
+## Training and Testing
+The source code for training is tools/train.py. To run this code, please use the following command:
+<pre>
+  <code>
+    python tools/train.py --checkpoint_path output/model
+  </code>
+</pre>
+
+The source code for testing is tools/test.py. To run this code, please use the following command:
+<pre>
+  <code>
+    python tools/eval.py
+  </code>
+</pre>
+
 ## Contact
 If you are interested in work or have any questions, please connect us: zhangxiaodan@bjut.edu.cn
 
