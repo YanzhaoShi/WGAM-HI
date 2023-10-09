@@ -1,0 +1,12 @@
+The sourse code about the weak labels.
+
+file: 1-weak_label_generation.py
+target: generate ground truth weak labels (frame weak labels and spatial weak labels)
+
+file: 2-weak_label_prediction.py
+target: predict weak labels (frame weak labels and spatial weak labels) by deep learning model
+
+file: 3-weak_label_fitting.py
+target: fit the predicted weak labels and ground truth labels by optimizing loss function
+
+more details see the annotation of each file
