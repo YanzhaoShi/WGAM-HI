@@ -58,7 +58,6 @@ class AttModel(CaptionModel):
         super(AttModel, self).__init__()
         self.vocab_size = opt.vocab_size
         self.input_encoding_size = opt.input_encoding_size
-        # self.rnn_type = opt.rnn_type
         self.rnn_size = opt.rnn_size
         self.num_layers = opt.num_layers
         self.drop_prob_lm = opt.drop_prob_lm
@@ -78,9 +77,6 @@ class AttModel(CaptionModel):
         self.embed = nn.Sequential(nn.Embedding(self.vocab_size + 1, self.input_encoding_size),
                                    nn.ReLU(),
                                    nn.Dropout(self.drop_prob_lm))
-        # self.fc_embed = nn.Sequential(nn.Linear(self.fc_feat_size, self.rnn_size),
-        #                               nn.ReLU(),
-        #                               nn.Dropout(self.drop_prob_lm))
 
         self.fc_embed = nn.Linear(self.fc_feat_size, self.rnn_size)
 
@@ -104,7 +100,6 @@ class AttModel(CaptionModel):
         # For remove bad endding
         self.vocab = opt.vocab
         self.bad_endings_ix = [int(k) for k, v in self.vocab.items() if v in bad_endings]
-        self.sentence_model = SentenceLSTM()
 
     def init_hidden(self, bsz):
         weight = self.logit.weight \
@@ -112,12 +107,6 @@ class AttModel(CaptionModel):
             else self.logit[0].weight
         return (weight.new_zeros(self.num_layers, bsz, self.rnn_size),
                 weight.new_zeros(self.num_layers, bsz, self.rnn_size))
-
-    def init_hidden_2(self, bsz):
-        weight = self.logit.weight \
-            if hasattr(self.logit, "weight") \
-            else self.logit[0].weight
-        return (weight.new_zeros(self.num_layers, bsz, self.rnn_size))
 
     def clip_att(self, att_feats, att_masks):
         # Clip the length of att_masks and att_feats to the maximum length
@@ -141,136 +130,82 @@ class AttModel(CaptionModel):
 
     def _forward(self, fc_feats, att_feats, seq, short_description, att_masks=None):
         batch_size = fc_feats.size(0)
-        seq_per_img = seq.shape[0] // batch_size
-        state = self.init_hidden(batch_size * 1)
-        states = self.init_hidden_2(batch_size * 1)
-        outputs = fc_feats.new_zeros(batch_size, seq.size(1), seq.size(2), self.vocab_size + 1)
-        pre_probs = fc_feats.new_zeros(batch_size, seq.size(1), 2)
+        seq_per_img = seq.shape[1]
+        state = self.init_hidden(batch_size )
+
+        outputs = fc_feats.new_zeros(batch_size, seq_per_img, seq.size(-1), self.vocab_size + 1)
         # Prepare the features
         p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = self._prepare_feature(fc_feats, att_feats, att_masks)
-        # pp_att_feats is used for attention, we cache it in advance to reduce computation cost
 
-        if seq_per_img > 1:
-            p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = utils.repeat_tensors(seq_per_img,
-                                                                                      [p_fc_feats, p_att_feats,
-                                                                                       pp_att_feats, p_att_masks]
-                                                                                      )
-        for s in range(seq.size(1)):
-            sen = seq[:, s, :]
-            init_h, init_c, p_stop, state_t = self.sentence_model.forward(fc_feats, states)
-            states = state_t
-            pre_probs[:, s] = p_stop
-
-            states_word = (init_h, init_c)
-            for i in range(sen.size(1)):
-                if self.training and i >= 1 and self.ss_prob > 0.0:  # otherwiste no need to sample
-                    sample_prob = fc_feats.new(batch_size).uniform_(0, 1)
+        att2_weights = []
+        scan_weight_out = []
+        scan_weight = fc_feats.new_full((batch_size, 24), 1, dtype=torch.float)
+        already_sen = fc_feats.new_full((batch_size, seq.shape[-1]), self.pad_idx, dtype=torch.long)
+        for sen_index in range(seq.size(1)):
+            for word_index in range(seq.size(2)):
+                if self.training and word_index >= 1 and self.ss_prob > 0.0:  # otherwiste no need to sample
+                    sample_prob = fc_feats.new(batch_size * seq_per_img).uniform_(0, 1)
                     sample_mask = sample_prob < self.ss_prob
                     if sample_mask.sum() == 0:
-                        it = sen[:, i].clone()
+                        it = seq[:, sen_index, word_index].clone()
                     else:
                         sample_ind = sample_mask.nonzero().view(-1)
-                        it = sen[:, i].data.clone()
-                        prob_prev = torch.exp(outputs[:, i - 1].detach())  # fetch prev distribution: shape Nx(M+1)
-                        it.index_copy_(0, sample_ind,
-                                       torch.multinomial(prob_prev, 1).view(-1).index_select(0, sample_ind))
+                        it = seq[:, sen_index, word_index].data.clone()
+                        prob_prev = torch.exp(outputs[:, sen_index, word_index - 1].detach())
+                        it.index_copy_(0, sample_ind, torch.multinomial(prob_prev, 1).view(-1).index_select(0, sample_ind))
                 else:
-                    it = sen[:, i].clone()
-                    # break if all the senuences end
-                if i >= 1 and sen[:, i].sum() == 0:
+                    it = seq[:, sen_index, word_index].clone()
+
+                # break if all the sequences end
+                if word_index >= 1 and seq[:, sen_index, word_index].sum() == 0:
                     break
+                output, state, scan_weight, att_weight = self.get_logprobs_state(sen_index, word_index,
+                                                                                 short_description,
+                                                                                 already_sen,
+                                                                                 it,
+                                                                                 p_fc_feats, p_att_feats, pp_att_feats,
+                                                                                 p_att_masks, state, scan_weight)
+                outputs[:, sen_index, word_index] = output
+                if word_index > 0 or sen_index > 0:
+                    att2_weights.append(att_weight)
+            scan_weight_out.append(scan_weight)
+            already_sen = seq[:, sen_index, :].clone()
 
-                if s > 0:
-                    last_sent = seq[:, s - 1, :]
-                else:
-                    last_sent = sen
+        scan2_out = torch.cat([_.unsqueeze(1) for _ in scan_weight_out], 1)
+        att2_out = torch.cat([_.unsqueeze(1) for _ in att2_weights], 1)
 
-                output, states_t_word = self.get_logprobs_state(i, s, last_sent, short_description, it, p_fc_feats,
-                                                                p_att_feats, pp_att_feats,
-                                                                p_att_masks, states_word)
-                states_word = states_t_word
-                outputs[:, s, i] = output
+        return outputs, scan2_out, att2_out, None, None, []
 
-        return outputs, [], [], None, None, pre_probs
-
-    def get_logprobs_state(self, i, s, last_sent, short_description, it, fc_feats, att_feats, p_att_feats, att_masks,
-                           state, output_logsoftmax=1):
-
+    def get_logprobs_state(self, sen_index, word_index, short_description, already_sen, it, fc_feats, att_feats,
+                           p_att_feats, att_masks,
+                           state,
+                           scan_weight, output_logsoftmax=1):
         xt = self.embed(it)
-
-        if s == 0:
-            sd = self.embed(short_description)
-
-        else:
-            sd = self.embed(last_sent)
-
-        output, state = self.core(i, s, sd, xt, fc_feats, att_feats, p_att_feats, state, att_masks)
+        sd = self.embed(short_description)
+        already_sen = self.embed(already_sen)
+        output, state, scan_weight, att_weight = self.core(sen_index, word_index, sd, already_sen, it, xt, fc_feats, att_feats,
+                                                           p_att_feats, state, scan_weight, att_masks)
         if output_logsoftmax:
             logprobs = F.log_softmax(self.logit(output), dim=1)
         else:
             logprobs = self.logit(output)
 
-        return logprobs, state
-
-    def _old_sample_beam(self, fc_feats, att_feats, att_masks=None, opt={}):
-        beam_size = opt.get('beam_size', 10)
-        group_size = opt.get('group_size', 1)
-        sample_n = opt.get('sample_n', 10)
-        # when sample_n == beam_size then each beam is a sample.
-        assert sample_n == 1 or sample_n == beam_size // group_size, 'when beam search, sample_n == 1 or beam search'
-        batch_size = fc_feats.size(0)
-
-        p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = self._prepare_feature(fc_feats, att_feats, att_masks)
-
-        assert beam_size <= self.vocab_size + 1, 'lets assume this for now, otherwise this corner case causes a few headaches down the road. can be dealt with in future if needed'
-        seq = fc_feats.new_full((batch_size * sample_n, self.seq_length), self.pad_idx, dtype=torch.long)
-        seqLogprobs = fc_feats.new_zeros(batch_size * sample_n, self.seq_length, self.vocab_size + 1)
-        # lets process every image independently for now, for simplicity
-
-        self.done_beams = [[] for _ in range(batch_size)]
-        for k in range(batch_size):
-            state = self.init_hidden(beam_size)
-            tmp_fc_feats, tmp_att_feats, tmp_p_att_feats, tmp_att_masks = utils.repeat_tensors(beam_size,
-                                                                                               [p_fc_feats[k:k + 1],
-                                                                                                p_att_feats[k:k + 1],
-                                                                                                pp_att_feats[k:k + 1],
-                                                                                                p_att_masks[
-                                                                                                k:k + 1] if att_masks is not None else None]
-                                                                                               )
-
-            for t in range(1):
-                if t == 0:  # input <bos>
-                    it = fc_feats.new_full([beam_size], self.bos_idx, dtype=torch.long)
-
-                logprobs, state = self.get_logprobs_state(it, tmp_fc_feats, tmp_att_feats, tmp_p_att_feats,
-                                                          tmp_att_masks, state)
-
-            self.done_beams[k] = self.old_beam_search(state, logprobs, tmp_fc_feats, tmp_att_feats, tmp_p_att_feats,
-                                                      tmp_att_masks, opt=opt)
-            if sample_n == beam_size:
-                for _n in range(sample_n):
-                    seq[k * sample_n + _n, :] = self.done_beams[k][_n]['seq']
-                    seqLogprobs[k * sample_n + _n, :] = self.done_beams[k][_n]['logps']
-            else:
-                seq[k, :] = self.done_beams[k][0]['seq']  # the first beam has highest cumulative score
-                seqLogprobs[k, :] = self.done_beams[k][0]['logps']
-        # return the samples and their log likelihoods
-        return seq, seqLogprobs
+        return logprobs, state, scan_weight, att_weight
 
     def _sample_beam(self, fc_feats, att_feats, att_masks=None, opt={}):
         beam_size = opt.get('beam_size', 10)
         group_size = opt.get('group_size', 1)
         sample_n = opt.get('sample_n', 10)
-        # when sample_n == beam_size then each beam is a sample.
         assert sample_n == 1 or sample_n == beam_size // group_size, 'when beam search, sample_n == 1 or beam search'
         batch_size = fc_feats.size(0)
 
         p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = self._prepare_feature(fc_feats, att_feats, att_masks)
 
-        assert beam_size <= self.vocab_size + 1, 'lets assume this for now, otherwise this corner case causes a few headaches down the road. can be dealt with in future if needed'
+        assert beam_size <= self.vocab_size + 1, \
+            'lets assume this for now, otherwise this corner case causes a few headaches down the road. ' \
+            'can be dealt with in future if needed'
         seq = fc_feats.new_full((batch_size * sample_n, self.seq_length), self.pad_idx, dtype=torch.long)
         seqLogprobs = fc_feats.new_zeros(batch_size * sample_n, self.seq_length, self.vocab_size + 1)
-        # lets process every image independently for now, for simplicity
 
         self.done_beams = [[] for _ in range(batch_size)]
 
@@ -299,6 +234,7 @@ class AttModel(CaptionModel):
         return seq, seqLogprobs
 
     def _sample(self, fc_feats, att_feats, short_description, att_masks=None, opt={}):
+
         seq_per_img = opt.get('seq_per_img')
         sample_method = opt.get('sample_method', 'greedy')
         beam_size = opt.get('beam_size', 1)
@@ -313,76 +249,63 @@ class AttModel(CaptionModel):
             return self._sample_beam(fc_feats, att_feats, att_masks, opt)
         if group_size > 1:
             return self._diverse_sample(fc_feats, att_feats, att_masks, opt)
-
         batch_size = fc_feats.size(0)
-        states = self.init_hidden_2(batch_size * 1)
+        state = self.init_hidden(batch_size * sample_n)
 
         p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = self._prepare_feature(fc_feats, att_feats, att_masks)
 
-        if sample_n > 1:
-            p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = utils.repeat_tensors(sample_n,
-                                                                                      [p_fc_feats, p_att_feats,
-                                                                                       pp_att_feats, p_att_masks]
-                                                                                      )
-
         trigrams = []  # will be a list of batch_size dictionaries
+
         seq = fc_feats.new_full((batch_size, seq_per_img, self.seq_length), self.pad_idx, dtype=torch.long)
         seqLogprobs = fc_feats.new_zeros(batch_size, seq_per_img, self.seq_length, self.vocab_size + 1)
-        pre_probs = fc_feats.new_zeros(batch_size, seq_per_img, 2)
-        for s in range(seq_per_img):
-            if s > 0:
-                last_sent = seq[:, s - 1, :]
-            else:
-                last_sent = short_description
-            init_h, init_c, p_stop, state_t = self.sentence_model.forward(fc_feats, states)
+        att2_weights = []
+        scan_weight_out = []
+        scan_weight = fc_feats.new_full((batch_size, 24), 1, dtype=torch.float)  # 初始的权重为1
+        already_sen = fc_feats.new_full((batch_size, seq.shape[-1]+1), self.pad_idx, dtype=torch.long)
 
-            if sum(torch.argmax(p_stop.data, 1)) == 0:
-                break
-
-            pre_probs[:, s] = p_stop
-            states = state_t
-            states_word = (init_h, init_c)
-            for t in range(self.seq_length + 1):
-                if t == 0:  # input <bos>
+        for sen_index in range(seq.size(1)):
+            for word_index in range(seq.size(2)):
+                if word_index == 0:  # input <bos>
                     it = fc_feats.new_full([batch_size * sample_n], self.bos_idx, dtype=torch.long)
 
-                logprobs, states_t_word = self.get_logprobs_state(t, s, last_sent, short_description, it, p_fc_feats,
-                                                                  p_att_feats, pp_att_feats, p_att_masks,
-                                                                  states_word,
-                                                                  output_logsoftmax=output_logsoftmax)
-                states_word = states_t_word
 
-                if decoding_constraint and t > 0:
+                logprobs, state, scan_weight, att_weight = self.get_logprobs_state(sen_index, word_index,
+                                                                                   short_description, already_sen,it,
+                                                                                   p_fc_feats,
+                                                                                   p_att_feats,
+                                                                                   pp_att_feats, p_att_masks, state,
+                                                                                   scan_weight)
+
+                if decoding_constraint and (sen_index + word_index) > 0:
                     tmp = logprobs.new_zeros(logprobs.size())
-                    tmp.scatter_(1, seq[:, s, t - 1].data.unsqueeze(1), float('-inf'))
+                    tmp.scatter_(1, seq[:, sen_index, word_index - 1].data.unsqueeze(1), float('-inf'))
                     logprobs = logprobs + tmp
 
-                if remove_bad_endings and t > 0:
+                if remove_bad_endings and (sen_index + word_index) > 0:
                     tmp = logprobs.new_zeros(logprobs.size())
-                    prev_bad = np.isin(seq[:, t - 1].data.cpu().numpy(), self.bad_endings_ix)
+                    prev_bad = np.isin(seq[:, sen_index, word_index - 1].data.cpu().numpy(), self.bad_endings_ix)
                     # Make it impossible to generate bad_endings
                     tmp[torch.from_numpy(prev_bad.astype('uint8')), 0] = float('-inf')
                     logprobs = logprobs + tmp
 
                 # Mess with trigrams
                 # Copy from https://github.com/lukemelas/image-paragraph-captioning
-                if block_trigrams and t >= 3:
+                if block_trigrams and word_index >= 3:
                     # Store trigram generated at last step
-                    prev_two_batch = seq[:, t - 3:t - 1]
+                    prev_two_batch = seq[:, word_index - 3:word_index - 1]
                     for i in range(batch_size):  # = seq.size(0)
                         prev_two = (prev_two_batch[i][0].item(), prev_two_batch[i][1].item())
-                        current = seq[i][t - 1]
-                        if t == 3:  # initialize
+                        current = seq[i][word_index - 1]
+                        if word_index == 3:  # initialize
                             trigrams.append({prev_two: [current]})  # {LongTensor: list containing 1 int}
-                        elif t > 3:
+                        elif word_index > 3:
                             if prev_two in trigrams[i]:  # add to list
                                 trigrams[i][prev_two].append(current)
                             else:  # create list
                                 trigrams[i][prev_two] = [current]
                     # Block used trigrams at next step
-                    prev_two_batch = seq[:, t - 2:t]
-                    mask = torch.zeros(logprobs.size(), requires_grad=False).to(
-                        logprobs.device)  # batch_size x vocab_size
+                    prev_two_batch = seq[:, word_index - 2:word_index]
+                    mask = torch.zeros(logprobs.size(), requires_grad=False).to(logprobs.device)  # batch_size x vocab_size
                     for i in range(batch_size):
                         prev_two = (prev_two_batch[i][0].item(), prev_two_batch[i][1].item())
                         if prev_two in trigrams[i]:
@@ -394,29 +317,29 @@ class AttModel(CaptionModel):
                     logprobs = logprobs + (mask * -0.693 * alpha)  # ln(1/2) * alpha (alpha -> infty works best)
 
                 # sample the next word
-                if t == self.seq_length:  # skip if we achieve maximum length
+                if word_index == self.seq_length:  # skip if we achieve maximum length
                     break
                 it, sampleLogprobs = self.sample_next_word(logprobs, sample_method, temperature)
 
                 # stop when all finished
-                if t == 0:
+                if word_index == 0:
                     unfinished = it != self.eos_idx
                 else:
                     it[~unfinished] = self.pad_idx  # This allows eos_idx not being overwritten to 0
                     logprobs = logprobs * unfinished.unsqueeze(1).to(logprobs)
                     unfinished = unfinished & (it != self.eos_idx)
-                seq[:, s, t] = it
-                seqLogprobs[:, s, t] = logprobs
+                seq[:, sen_index, word_index] = it
+                seqLogprobs[:, sen_index, word_index] = logprobs
                 # quit loop if all sequences have finished
                 if unfinished.sum() == 0:
                     break
-
-        pre_probs = torch.argmax(pre_probs, 2)
-        for stop_i in torch.sum(pre_probs, 1):
-            seq[:, stop_i:, :] = fc_feats.new_full((batch_size, seq_per_img-stop_i, self.seq_length), self.pad_idx,
-                                                   dtype=torch.long)
-
-        return seq, seqLogprobs, pre_probs, []
+                if word_index > 0 or sen_index > 0:
+                    att2_weights.append(att_weight)
+            scan_weight_out.append(scan_weight)
+            already_sen = torch.cat((already_sen[:, :1], seq[:, sen_index, :]), 1)
+            scan2_out = torch.cat([_.unsqueeze(1) for _ in scan_weight_out], 1)
+            att2_out = torch.cat([_.unsqueeze(1) for _ in att2_weights], 1)
+        return seq, seqLogprobs, att2_out, scan2_out
 
     def _diverse_sample(self, fc_feats, att_feats, att_masks=None, opt={}):
 
@@ -516,34 +439,123 @@ class AttModel(CaptionModel):
                     seq[:, t] = it
                     seqLogprobs[:, t] = sampleLogprobs.view(-1)
 
-        return torch.stack(seq_table, 1).reshape(batch_size * group_size, -1), torch.stack(seqLogprobs_table,
-                                                                                           1).reshape(
-            batch_size * group_size, -1)
+        return torch.stack(seq_table, 1).reshape(batch_size * group_size, -1), torch.stack(seqLogprobs_table,1).reshape(batch_size * group_size, -1)
+
+
+class UpDownModel(AttModel):
+    def __init__(self, opt):
+        super(UpDownModel, self).__init__(opt)
+        self.num_layers = 2
+        self.core = UpDownCore(opt)
 
 
 class UpDownCore(nn.Module):
     def __init__(self, opt, use_maxout=False):
         super(UpDownCore, self).__init__()
         self.drop_prob_lm = opt.drop_prob_lm
+        self.first_lang_lstm = nn.LSTMCell(15 * opt.input_encoding_size, opt.rnn_size)
+        self.sen_lstm = nn.LSTMCell((opt.max_length+1) * opt.input_encoding_size + opt.rnn_size, opt.rnn_size)
+        self.lang_lstm = nn.LSTMCell(opt.rnn_size * 3, opt.rnn_size)
+        self.frame_attention = Frame_Attention(opt)
+        self.spatial_attention = Spatial_Attention(opt)
 
-        self.lang_lstm = nn.LSTMCell(opt.rnn_size, opt.rnn_size)  # h^1_t, \hat v
-        self.attention = Attention(opt)
-
-    def forward(self, i, s, short_description, xt, fc_feats, att_feats, p_att_feats, state, att_masks=None):
-
-        att = self.attention(state[0], att_feats, p_att_feats, att_masks)
-        h_lang, c_lang = self.lang_lstm(att, (state[0], state[1]))
-
+    def forward(self, sen_index, word_index, short_description, already_sen, it, xt, fc_feats, att_feats, p_att_feats,
+                state,
+                scan_weight, att_masks=None):
+        att_weight = []
+        fc_ = torch.bmm(scan_weight.unsqueeze(1), fc_feats).squeeze(1)
+        if sen_index == 0 and word_index == 0:
+            h_lang, c_lang = self.first_lang_lstm(short_description.view(fc_feats.size(0), -1),(state[0][1], state[1][1]))
+            h_sen = h_lang
+            c_sen = c_lang
+        else:
+            if word_index == 0 or (sen_index == 0 and word_index == 1):
+                _, scan_weight = self.frame_attention(state[0][0], fc_feats, att_masks)
+                sen_input = torch.cat([already_sen.view(fc_feats.size(0), -1), fc_], 1)
+                h_sen, c_sen = self.sen_lstm(sen_input, (state[0][0], state[1][0]))
+                ######### frame_weight #################
+            else:
+                h_sen, c_sen = state[0][0], state[1][0]
+            ######### att_weight #################
+            att_feats = att_feats.permute(1, 0, 2, 3)  # 4,24,196,512
+            p_att_feats = p_att_feats.permute(1, 0, 2, 3)
+            att_weight = []
+            for i in range(att_feats.size(0)):
+                _, weight = self.spatial_attention(state[0][1], att_feats[i], p_att_feats[i], att_masks)
+                att_weight.append(weight)
+            att_weight = torch.cat([_.unsqueeze(1) for _ in att_weight], 1)
+            att = torch.bmm(att_weight.view(-1, 196).unsqueeze(1),
+                            att_feats.contiguous().view(-1, 196, 512)).squeeze(1).view(-1, 24, 512)
+            att = torch.bmm(scan_weight.unsqueeze(1), att).squeeze(1)
+            lang_lstm_input = torch.cat([att, h_sen, xt], 1)
+            h_lang, c_lang = self.lang_lstm(lang_lstm_input, (state[0][1], state[1][1]))
         output = F.dropout(h_lang, self.drop_prob_lm, self.training)
+        state = (torch.stack([h_sen,h_lang]), torch.stack([c_sen, c_lang]))
+        return output, state, scan_weight, att_weight
 
-        return output, [h_lang, c_lang]
+
+class Frame_Attention(nn.Module):
+    def __init__(self, opt):
+        super(Frame_Attention, self).__init__()
+        self.rnn_size = opt.rnn_size
+        self.att_hid_size = opt.att_hid_size
+        self.fc2p = nn.Linear(self.rnn_size, self.att_hid_size)
+        self.h2att = nn.Linear(self.rnn_size, self.att_hid_size)
+        self.alpha_net = nn.Linear(self.att_hid_size, 1)
+
+    def forward(self, h, fc_feats, att_masks=None):
+        # The p_att_feats here is already projected
+        p_fc_feats = self.fc2p(fc_feats)
+        att_size = fc_feats.numel() // fc_feats.size(0) // fc_feats.size(-1)
+        fc = p_fc_feats.view(-1, att_size, fc_feats.size(-1))
+        att_h = self.h2att(h)  # batch * att_hid_size
+        att_h = att_h.unsqueeze(1).expand_as(fc)  # batch * att_size * att_hid_size
+        dot = fc + att_h  # batch * att_size * att_hid_size
+        dot = torch.tanh(dot)  # batch * att_size * att_hid_size
+        dot = dot.view(-1, self.att_hid_size)  # (batch * att_size) * att_hid_size
+        dot = self.alpha_net(dot)  # (batch * att_size) * 1
+        dot = dot.view(-1, att_size)  # batch * att_size
+        weight = F.softmax(dot, dim=1)  # batch * att_size
+        if att_masks is not None:
+            weight = weight * att_masks.view(-1, att_size).to(weight)
+            weight = weight / weight.sum(1, keepdim=True)  # normalize to 1
+        fc_feats_ = fc_feats.view(-1, att_size, fc_feats.size(-1))  # batch * att_size * att_feat_size
+        fc_res = torch.bmm(weight.unsqueeze(1), fc_feats_).squeeze(1)  # batch * att_feat_size
+        return fc_res, weight
+
+
+class Spatial_Attention(nn.Module):
+    def __init__(self, opt):
+        super(Spatial_Attention, self).__init__()
+        self.rnn_size = opt.rnn_size
+        self.att_hid_size = opt.att_hid_size
+        self.h2att = nn.Linear(self.rnn_size, self.att_hid_size)
+        self.alpha_net = nn.Linear(self.att_hid_size, 1)
+
+    def forward(self, h, att_feats, p_att_feats, att_masks=None):
+        # The p_att_feats here is already projected
+        att_size = att_feats.numel() // att_feats.size(0) // att_feats.size(-1)
+        att = p_att_feats.view(-1, att_size, self.att_hid_size)
+        att_h = self.h2att(h)  # batch * att_hid_size
+        att_h = att_h.unsqueeze(1).expand_as(att)  # batch * att_size * att_hid_size
+        dot = att + att_h  # batch * att_size * att_hid_size
+        dot = torch.tanh(dot)  # batch * att_size * att_hid_size
+        dot = dot.view(-1, self.att_hid_size)  # (batch * att_size) * att_hid_size
+        dot = self.alpha_net(dot)  # (batch * att_size) * 1
+        dot = dot.view(-1, att_size)  # batch * att_size
+        weight = F.softmax(dot, dim=1)  # batch * att_size
+        if att_masks is not None:
+            weight = weight * att_masks.view(-1, att_size).to(weight)
+            weight = weight / weight.sum(1, keepdim=True)  # normalize to 1
+        att_feats_ = att_feats.view(-1, att_size, att_feats.size(-1))  # batch * att_size * att_feat_size
+        att_res = torch.bmm(weight.unsqueeze(1), att_feats_).squeeze(1)  # batch * att_feat_size
+        return att_res, weight
 
 
 class AdaAtt_lstm(nn.Module):
     def __init__(self, opt, use_maxout=True):
         super(AdaAtt_lstm, self).__init__()
         self.input_encoding_size = opt.input_encoding_size
-        # self.rnn_type = opt.rnn_type
         self.rnn_size = opt.rnn_size
         self.num_layers = opt.num_layers
         self.drop_prob_lm = opt.drop_prob_lm
@@ -629,58 +641,10 @@ class AdaAtt_lstm(nn.Module):
         return top_h, fake_region, state
 
 
-class SentenceLSTM(nn.Module):
-    def __init__(self,
-                 # version = 'v1',
-                 embed_size=512,
-                 hidden_size=512,
-                 num_spatial=49,  # input_image_size=(224,224)
-                 num_layers=1,
-                 # dropout = 0.3,
-                 momentum=0.1):
-        super(SentenceLSTM, self).__init__()
-
-        self.lstm = nn.LSTMCell(embed_size, hidden_size)
-        self.affine_y = nn.Linear(embed_size * 4, hidden_size, bias=True)
-        self.W_stop = nn.Linear(in_features=hidden_size,
-                                out_features=2, bias=True)
-        self.init_wordh = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.init_wordc = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
-        self.softmax = nn.Softmax()
-        self.dropout = nn.Dropout(0.5)
-        self.__init_weights()
-
-    def __init_weights(self):
-        self.W_stop.weight.data.uniform_(-0.1, 0.1)
-        self.W_stop.bias.data.fill_(0)
-        self.init_wordh.weight.data.uniform_(-0.1, 0.1)
-        self.init_wordh.bias.data.fill_(0)
-        self.init_wordc.weight.data.uniform_(-0.1, 0.1)
-        self.init_wordc.bias.data.fill_(0)
-        self.affine_y.weight.data.uniform_(-0.1, 0.1)
-        self.affine_y.bias.data.fill_(0)
-
-    def forward(self, avg_cat_features, state):
-        """
-        topic is transformed by two fully connection layers
-        """
-        avg_cat_features = avg_cat_features.mean(1)
-        input_y = self.affine_y(avg_cat_features)
-        h, c = self.lstm(input_y, [state[0], state[1]])
-        p_stop = self.W_stop(h)
-        h0_word = self.tanh(self.init_wordh(self.dropout(h)))
-        c0_word = self.tanh(self.init_wordc(self.dropout(h)))
-
-        return h0_word, c0_word, p_stop, [h, c]
-
-
 class AdaAtt_attention(nn.Module):
     def __init__(self, opt):
         super(AdaAtt_attention, self).__init__()
         self.input_encoding_size = opt.input_encoding_size
-        # self.rnn_type = opt.rnn_type
         self.rnn_size = opt.rnn_size
         self.drop_prob_lm = opt.drop_prob_lm
         self.att_hid_size = opt.att_hid_size
@@ -691,8 +655,6 @@ class AdaAtt_attention(nn.Module):
             nn.ReLU(),
             nn.Dropout(self.drop_prob_lm))
         self.fr_embed = nn.Linear(self.input_encoding_size, self.att_hid_size)
-
-        # h out embed
         self.ho_linear = nn.Sequential(
             nn.Linear(self.rnn_size, self.input_encoding_size),
             nn.Tanh(),
@@ -775,12 +737,9 @@ class StackAttCore(nn.Module):
         self.lstm1 = LSTMCore(opt)
         self.lstm2 = LSTMCore(opt)
         opt.input_encoding_size = opt_input_encoding_size
-
-        # self.emb1 = nn.Linear(opt.rnn_size, opt.rnn_size)
         self.emb2 = nn.Linear(opt.rnn_size, opt.rnn_size)
 
     def forward(self, xt, fc_feats, att_feats, p_att_feats, state, att_masks=None):
-        # att_res_0 = self.att0(state[0][-1], att_feats, p_att_feats, att_masks)
         h_0, state_0 = self.lstm0(torch.cat([xt, fc_feats], 1), [state[0][0:1], state[1][0:1]])
         att_res_1 = self.att1(h_0, att_feats, p_att_feats, att_masks)
         h_1, state_1 = self.lstm1(torch.cat([h_0, att_res_1], 1), [state[0][1:2], state[1][1:2]])
@@ -794,11 +753,8 @@ class DenseAttCore(nn.Module):
     def __init__(self, opt, use_maxout=False):
         super(DenseAttCore, self).__init__()
         self.drop_prob_lm = opt.drop_prob_lm
-
-        # self.att0 = Attention(opt)
         self.att1 = Attention(opt)
         self.att2 = Attention(opt)
-
         opt_input_encoding_size = opt.input_encoding_size
         opt.input_encoding_size = opt.input_encoding_size + opt.rnn_size
         self.lstm0 = LSTMCore(opt)  # att_feat + word_embedding
@@ -806,21 +762,15 @@ class DenseAttCore(nn.Module):
         self.lstm1 = LSTMCore(opt)
         self.lstm2 = LSTMCore(opt)
         opt.input_encoding_size = opt_input_encoding_size
-
-        # self.emb1 = nn.Linear(opt.rnn_size, opt.rnn_size)
         self.emb2 = nn.Linear(opt.rnn_size, opt.rnn_size)
-
-        # fuse h_0 and h_1
         self.fusion1 = nn.Sequential(nn.Linear(opt.rnn_size * 2, opt.rnn_size),
                                      nn.ReLU(),
                                      nn.Dropout(opt.drop_prob_lm))
-        # fuse h_0, h_1 and h_2
         self.fusion2 = nn.Sequential(nn.Linear(opt.rnn_size * 3, opt.rnn_size),
                                      nn.ReLU(),
                                      nn.Dropout(opt.drop_prob_lm))
 
     def forward(self, xt, fc_feats, att_feats, p_att_feats, state, att_masks=None):
-        # att_res_0 = self.att0(state[0][-1], att_feats, p_att_feats, att_masks)
         h_0, state_0 = self.lstm0(torch.cat([xt, fc_feats], 1), [state[0][0:1], state[1][0:1]])
         att_res_1 = self.att1(h_0, att_feats, p_att_feats, att_masks)
         h_1, state_1 = self.lstm1(torch.cat([h_0, att_res_1], 1), [state[0][1:2], state[1][1:2]])
@@ -831,50 +781,15 @@ class DenseAttCore(nn.Module):
         return self.fusion2(torch.cat([h_0, h_1, h_2], 1)), [torch.cat(_, 0) for _ in zip(state_0, state_1, state_2)]
 
 
-class Attention(nn.Module):
-    def __init__(self, opt):
-        super(Attention, self).__init__()
-        self.rnn_size = opt.rnn_size
-        self.att_hid_size = opt.att_hid_size
-
-        self.h2att = nn.Linear(self.rnn_size, self.att_hid_size)
-        self.alpha_net = nn.Linear(self.att_hid_size, 1)
-
-    def forward(self, h, att_feats, p_att_feats, att_masks=None):
-        # The p_att_feats here is already projected
-        att_size = att_feats.numel() // att_feats.size(0) // att_feats.size(-1)
-        att = p_att_feats.view(-1, att_size, self.att_hid_size)
-
-        att_h = self.h2att(h)  # batch * att_hid_size
-        att_h = att_h.unsqueeze(1).expand_as(att)  # batch * att_size * att_hid_size
-        dot = att + att_h  # batch * att_size * att_hid_size
-        dot = torch.tanh(dot)  # batch * att_size * att_hid_size
-        dot = dot.view(-1, self.att_hid_size)  # (batch * att_size) * att_hid_size
-        dot = self.alpha_net(dot)  # (batch * att_size) * 1
-        dot = dot.view(-1, att_size)  # batch * att_size
-
-        weight = F.softmax(dot, dim=1)  # batch * att_size
-        if att_masks is not None:
-            weight = weight * att_masks.view(-1, att_size).to(weight)
-            weight = weight / weight.sum(1, keepdim=True)  # normalize to 1
-        att_feats_ = att_feats.view(-1, att_size, att_feats.size(-1))  # batch * att_size * att_feat_size
-        att_res = torch.bmm(weight.unsqueeze(1), att_feats_).squeeze(1)  # batch * att_feat_size
-
-        return att_res
-
-
 class Att2in2Core(nn.Module):
     def __init__(self, opt):
         super(Att2in2Core, self).__init__()
         self.input_encoding_size = opt.input_encoding_size
-        # self.rnn_type = opt.rnn_type
         self.rnn_size = opt.rnn_size
-        # self.num_layers = opt.num_layers
         self.drop_prob_lm = opt.drop_prob_lm
         self.fc_feat_size = opt.fc_feat_size
         self.att_feat_size = opt.att_feat_size
         self.att_hid_size = opt.att_hid_size
-
         # Build a LSTM
         self.a2c = nn.Linear(self.rnn_size, 2 * self.rnn_size)
         self.i2h = nn.Linear(self.input_encoding_size, 5 * self.rnn_size)
@@ -911,12 +826,6 @@ class Att2inCore(Att2in2Core):
         super(Att2inCore, self).__init__(opt)
         del self.a2c
         self.a2c = nn.Linear(self.att_feat_size, 2 * self.rnn_size)
-
-
-"""
-Note this is my attempt to replicate att2all model in self-critical paper.
-However, this is not a correct replication actually. Will fix it.
-"""
 
 
 class Att2all2Core(nn.Module):
@@ -960,14 +869,11 @@ class Att2all2Core(nn.Module):
         state = (next_h.unsqueeze(0), next_c.unsqueeze(0))
         return output, state
 
-
 class AdaAttModel(AttModel):
     def __init__(self, opt):
         super(AdaAttModel, self).__init__(opt)
         self.core = AdaAttCore(opt)
 
-
-# AdaAtt with maxout lstm
 class AdaAttMOModel(AttModel):
     def __init__(self, opt):
         super(AdaAttMOModel, self).__init__(opt)
@@ -988,13 +894,6 @@ class Att2all2Model(AttModel):
         self.core = Att2all2Core(opt)
         delattr(self, 'fc_embed')
         self.fc_embed = lambda x: x
-
-
-class UpDownModel(AttModel):
-    def __init__(self, opt):
-        super(UpDownModel, self).__init__(opt)
-        self.num_layers = 2
-        self.core = UpDownCore(opt)
 
 
 class StackAttModel(AttModel):
@@ -1041,14 +940,6 @@ class NewFCModel(AttModel):
         self.ctx2att = lambda x: x
 
     def core(self, xt, fc_feats, att_feats, p_att_feats, state, att_masks):
-        # Step 0, feed the input image
-        # if (self.training and state[0].is_leaf) or \
-        #     (not self.training and state[0].sum() == 0):
-        #     _, state = self._core(fc_feats, state)
-        # three cases
-
-        # beam search (diverse beam search)
-        # fixed captioning module.
         is_first_step = (state[0] == 0).all(2).all(0)  # size: B
         if is_first_step.all():
             _, state = self._core(fc_feats, state)
@@ -1061,9 +952,6 @@ class NewFCModel(AttModel):
             new_state[0][:, is_first_step] = state[0][:, is_first_step]
             new_state[1][:, is_first_step] = state[1][:, is_first_step]
             state = new_state
-        # if (state[0]==0).all():
-        #     # Let's forget about diverse beam search first
-        #     _, state = self._core(fc_feats, state)
         return self._core(xt, state)
 
     def _prepare_feature(self, fc_feats, att_feats, att_masks):
