@@ -1,5 +1,5 @@
 '''
-This file is a part of 'WGAM-HI\captioning\modules\losses.py' and is primarily used to demonstrate how the model fits the predicted weak labels to the ground truth weak labels through optimization of the loss function (line 93-101).
+This file is a part of 'WGAM-HI\captioning\modules\losses.py' and is primarily used to demonstrate how the model fits the predicted weak labels to the ground truth weak labels through optimization of the loss function (line 88-96).
 For more details, please see 'WGAM-HI\captioning\modules\losses.py'
 
 '''
