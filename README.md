@@ -1,6 +1,6 @@
 # WGAM-HI
 
-Official code for "Weakly Guided Attention Model with Hierarchical Interaction for Brain CT Report Generation" (CIBM, under review)
+Official code for "Weakly Guided Attention Model with Hierarchical Interaction for Brain CT Report Generation" (CIBM, 2023)
 
 In this paper, we propose a novel Weakly Guided Attention Model with Hierarchical Interaction, named WGAM-HI, to improve Brain CT report generation.
 
